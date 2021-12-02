@@ -1,704 +1,1044 @@
-from tactical_yutnori import *
-from itertools import islice
-from math import hypot
-import pygame
-import pygame.gfxdraw
-from pygame import Surface, Color, Rect
-import ctypes
+import sys
+from types import MappingProxyType, DynamicClassAttribute
 
 
+__all__ = [
+        'EnumMeta',
+        'Enum', 'IntEnum', 'Flag', 'IntFlag',
+        'auto', 'unique',
+        ]
 
-class App:
 
-    config = dict(
-        WSIZE   = (600, 600),
-        FPS     = 30,
-        TITLE   = '다함께 하지마마 윷윷윷'
-    )
+def _is_descriptor(obj):
+    """
+    Returns True if obj is a descriptor, False otherwise.
+    """
+    return (
+            hasattr(obj, '__get__') or
+            hasattr(obj, '__set__') or
+            hasattr(obj, '__delete__')
+            )
 
+def _is_dunder(name):
+    """
+    Returns True if a __dunder__ name, False otherwise.
+    """
+    return (
+            len(name) > 4 and
+            name[:2] == name[-2:] == '__' and
+            name[2] != '_' and
+            name[-3] != '_'
+            )
+
+def _is_sunder(name):
+    """
+    Returns True if a _sunder_ name, False otherwise.
+    """
+    return (
+            len(name) > 2 and
+            name[0] == name[-1] == '_' and
+            name[1:2] != '_' and
+            name[-2:-1] != '_'
+            )
+
+def _is_private(cls_name, name):
+    # do not use `re` as `re` imports `enum`
+    pattern = '_%s__' % (cls_name, )
+    if (
+            len(name) >= 5
+            and name.startswith(pattern)
+            and name[len(pattern)] != '_'
+            and (name[-1] != '_' or name[-2] != '_')
+        ):
+        return True
+    else:
+        return False
+
+def _make_class_unpicklable(cls):
+    """
+    Make the given class un-picklable.
+    """
+    def _break_on_call_reduce(self, proto):
+        raise TypeError('%r cannot be pickled' % self)
+    cls.__reduce_ex__ = _break_on_call_reduce
+    cls.__module__ = '<unknown>'
+
+_auto_null = object()
+class auto:
+    """
+    Instances are replaced with an appropriate value in Enum class suites.
+    """
+    value = _auto_null
+
+
+class _EnumDict(dict):
+    """
+    Track enum member order and ensure member names are not reused.
+
+    EnumMeta will use the names found in self._member_names as the
+    enumeration member names.
+    """
     def __init__(self):
-        self.game = YutNoriHumVsCom()
-        self._config()
+        super().__init__()
+        self._member_names = []
+        self._last_values = []
+        self._ignore = []
+        self._auto_called = False
 
-    def _config(self):
-        self.WIDTH, self.HEIGHT = self.config['WSIZE']
-        self.FPS = self.config['FPS']
+    def __setitem__(self, key, value):
+        """
+        Changes anything not dundered or not a descriptor.
 
-        pygame.init()
-        ctypes.windll.user32.SetProcessDPIAware()
+        If an enum member name is used twice, an error is raised; duplicate
+        values are not checked for.
 
-        self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT))
-        self.clock = pygame.time.Clock()
-
-        pygame.display.set_caption(self.config['TITLE'])
-
-    def run(self):
-        self.game.reset()
-        self.GUI = GUI(self.game)
-
-        stop = False
-
-        while not stop:
-            self.GUI.draw(self.screen)
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT or \
-                  (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
-                    stop = True
-
-            self.GUI.update()
-
-            pygame.display.flip()
-            self.clock.tick(self.FPS)
-
-        pygame.quit()
-
-
-class Timer:
-
-    def is_on(self, name=0):
-        return hasattr(self, f't_{name}')
-
-    def start(self, name=0):
-        if not hasattr(self, f't_{name}'):
-            setattr(self, f't_{name}', pygame.time.get_ticks())
-
-    def elapsed(self, name=0):
-        return (pygame.time.get_ticks() - getattr(self, f't_{name}')) / 1000.0
-
-    def reset(self, name=0):
-        delattr(self, f't_{name}')
-
-    def restart(self):
-        self.reset()
-        self.start()
-
-
-class GUI:
-
-    def __init__(self, game):
-        self.game = game
-
-        # Constants and Refs
-        self.PLAYER1, self.PLAYER2 = game.players
-        self.N_PIECES_PER_PLAYER = game.N_PIECES_PER_PLAYER
-        self.NODE_OUT, self.NODE_WON = game.NODE_OUT, game.NODE_WON
-
-        self.isP1 = lambda p: self.game.owner(p) == self.PLAYER1
-        self.isP2 = lambda p: self.game.owner(p) == self.PLAYER2
-
-        # Position and Scaling
-        W, H = pygame.display.get_surface().get_size()
-
-        # Board Graph
-        x, y, w, h = self.graph_rect = Rect([W//25, W//25, W*63//100, W*63//100])
-        self.corner_node_radius = self.graph_rect.width//25
-        self.normal_node_radius = self.graph_rect.width//30
-        self.piece_radius = self.normal_node_radius*3//4
-
-        # Regions out
-        s = W - w   # space right
-        self.regout1_rect = Rect([x + w + s//4, y, s//2, h*22//100])
-        self.regout2_rect = Rect([x + w + s//4, y + h*33//100, s//2, h*22//100])
-
-        # Table
-        s = H - h  # space bottom
-        *_, w, h = self.table_rect = Rect([x, H-s*3//4, w, s*3//4])
-        self.sset_size = w * 27//100, h * 2//3
-        self.stick_size = w * 6//100, h * 2//3
-
-        # Nodes in (= Pieces in = centers rel to graph)
-        self.nodes_rel_centers = self._arrange_nodes()
-        self.nodes_abs_centers = self.get_nodes_abs_centers()
-
-        # Pieces out (centers rel to regions out)
-        self.piecesout_rel_centers = self._arrange_pieces()
-        self.piecesout_abs_centers = self.get_piecesout_abs_centers()
-
-        # Sticksets (toplefts rel to table)
-        self.ssets_rel_toplefts = self._arrange_sticksets()
-        self.ssets_abs_toplefts = self.get_sticksets_abs_toplefts()
-
-        # Tossed-Sticks (toplefts rels to table)
-        self.tossedsticks_rel_toplefts = self._arrange_tossedsticks()
-        self.tossedsticks_abs_toplefts = self.get_tossedsticks_abs_toplefts()
-
-        # Style
-        self.BGCOLOR = Color(235,235,235)
-        self.FONT = pygame.font.SysFont('Arial', 13)
-        self.FONT.set_bold(True)
-
-        # Nodes
-        self.corner_style = (Color('orange'), Color('black'), 1)
-        self.normal_style = (Color('white'), Color('black'), 1)
-        self.hlight_style = (Color('lightblue'), 3)
-
-        # Regions out (player1, player2)
-        self.regout1_style = (Color('blue'), Color('black'), 2, 0.5)
-        self.regout2_style = (Color('red'), Color('black'), 2, 0.5)
-
-        # Pieces (player1, player2)
-        self.player1_color_str, self.player2_color_str = 'BLUE', 'RED'
-        self.piece1_style = (Color('blue'), Color('black'), 0)
-        self.piece2_style = (Color('red'), Color('black'), 0)
-
-        # Table and sticks
-        self.table_style = (Color('brown'), Color('black'), 0, 0.95)
-        self.stick_style = (Color('beige'), Color('black'), 2)
-
-        # Static Images
-        self.graph_im = self.get_graph_image()
-        self.regout1_im, self.regout2_im = self.get_regionsout_images()
-        self.table_im = self.get_table_image()
-        self.stickM_im = self.get_stick_image(StickType.MARKED)
-        self.stickU_im = self.get_stick_image(StickType.UNMARKED)
-        self.ssets_im = self.get_sticksets_images()
-        self.playerturn_im = self.get_playerturn_images()
-        self.playerwins_im = self.get_playerwins_images()
-
-        # Some Presentation Logic
-        self.timer = Timer()
-        self.timer.start()
-        self.sset_sel = None
-        self.node_sel = None
-        self.hlight_nodes = []
-        self.winner = None
-
-    # UPDATE
-    def update(self):
-
-        if self.get_winner():
-            self.check_replay_selection()
-        
-        else:
-            
-            if not self.timer.is_on('turn'):
-                self.timer.start('turn')
-
-            if not self.game.sticks_been_tossed():
-                self.check_sticksets_selection()
-                sel = self.get_stickset_selected()
-                if sel in self.game.valid_stick_pairs:
-                    self.game.toss(sel)
-                    self.timer.start('delay')
-
-            elif self.timer.elapsed('delay') > 0.5:
-                
-                if not self.game.orig_node_been_selected():
-                        self.highlight_nodes(self.game.valid_orig_nodes_for_selection())
-                        self.check_node_selection(self.hlight_nodes)
-                        sel = self.get_node_selected()
-                        if sel in self.game.valid_orig_nodes_for_selection():
-                            self.game.select_orig_node(sel)
-
-                elif not self.game.dest_node_been_selected():
-                        self.highlight_nodes(self.game.valid_dest_nodes_for_selection())
-                        self.check_node_selection(self.hlight_nodes)
-                        sel = self.get_node_selected()
-                        if sel in self.game.valid_dest_nodes_for_selection():
-                            self.game.select_dest_node(sel)
-
-                elif self.timer.elapsed('turn') > 1.8:
-                    # everything selected -> proceed
-                    ok = self.game.step()
-                    if ok:
-                        self.timer.reset('turn')
-                        self.timer.reset('delay')
-                        self.hlight_nodes = []
-                        self.node_sel = None
-                        self.sset_sel = None
-                        self.check_winner()
-
-    # DRAW
-    def draw(self, surf):
-        # static
-        surf.fill(self.BGCOLOR)
-        surf.blit(self.graph_im, self.graph_rect)
-        surf.blit(self.regout1_im, self.regout1_rect)
-        surf.blit(self.regout2_im, self.regout2_rect)
-        surf.blit(self.table_im, self.table_rect)
-        # dynamic
-        self.draw_playerturn(surf)
-        self.draw_highlighted_nodes(surf)
-        self.draw_pieces(surf)
-        self.draw_sticks(surf)
-        self.draw_playerwins(surf)
-
-    def draw_playerturn(self, surf):
-        surf.blit(self.playerturn_im[self.game.cur_player], self.playerturn_rect)
-
-    def draw_highlighted_nodes(self, surf):
-        stroke, t = self.hlight_style
-
-        for nodekey in self.hlight_nodes:
-
-            if nodekey == self.NODE_OUT:
-                radius = self.piece_radius
-                pieces = (p for p in self.game.board[self.NODE_OUT] if self.game.owner(p) == self.game.cur_player)
-                for piece, center in zip(pieces, self.piecesout_abs_centers[self.game.cur_player]):
-                    pygame.draw.circle(surf, stroke, center, radius + t, t)
-
-            elif nodekey == self.NODE_WON:
-                radius = self.corner_node_radius
-                x, y = self.nodes_abs_centers[BoardNode.CORNERS.SE]
-                x += 4 * radius
-                pygame.gfxdraw.aacircle(surf, x, y, radius+t, Color('gold'))
-                pygame.gfxdraw.filled_circle(surf, x, y, radius+t, Color('gold'))
-                fill, stroke, t = self.normal_style
-                pygame.gfxdraw.aacircle(surf, x, y, radius, stroke)
-                pygame.gfxdraw.filled_circle(surf, x, y, radius, stroke)
-                pygame.gfxdraw.aacircle(surf, x, y, radius-t-t, fill)
-                pygame.gfxdraw.filled_circle(surf, x, y, radius-t-t, fill)
-
-            else:
-                radius = self.corner_node_radius if nodekey in BoardNode.CORNERS else \
-                         self.normal_node_radius
-                center = self.nodes_abs_centers[nodekey]
-                pygame.draw.circle(surf, stroke, center, radius + t, t)
-
-    def draw_pieces(self, surf):
-        piecesout1 = (p for p in self.piecesout_abs_centers[self.PLAYER1])
-        piecesout2 = (p for p in self.piecesout_abs_centers[self.PLAYER2])
-
-        for piece, nodekey in self.game.all_pieces_and_nodes():
-
-            if nodekey == self.NODE_OUT:
-                if self.isP1(piece):
-                    x, y = next(piecesout1)
-                    fill, stroke, t = self.piece1_style
+        Single underscore (sunder) names are reserved.
+        """
+        if _is_private(self._cls_name, key):
+            import warnings
+            warnings.warn(
+                    "private variables, such as %r, will be normal attributes in 3.10"
+                        % (key, ),
+                    DeprecationWarning,
+                    stacklevel=2,
+                    )
+        if _is_sunder(key):
+            if key not in (
+                    '_order_', '_create_pseudo_member_',
+                    '_generate_next_value_', '_missing_', '_ignore_',
+                    ):
+                raise ValueError('_names_ are reserved for future Enum use')
+            if key == '_generate_next_value_':
+                # check if members already defined as auto()
+                if self._auto_called:
+                    raise TypeError("_generate_next_value_ must be defined before members")
+                setattr(self, '_generate_next_value', value)
+            elif key == '_ignore_':
+                if isinstance(value, str):
+                    value = value.replace(',',' ').split()
                 else:
-                    x, y = next(piecesout2)
-                    fill, stroke, t = self.piece2_style
+                    value = list(value)
+                self._ignore = value
+                already = set(value) & set(self._member_names)
+                if already:
+                    raise ValueError(
+                            '_ignore_ cannot specify already set names: %r'
+                            % (already, )
+                            )
+        elif _is_dunder(key):
+            if key == '__order__':
+                key = '_order_'
+        elif key in self._member_names:
+            # descriptor overwriting an enum?
+            raise TypeError('Attempted to reuse key: %r' % key)
+        elif key in self._ignore:
+            pass
+        elif not _is_descriptor(value):
+            if key in self:
+                # enum overwriting a descriptor?
+                raise TypeError('%r already defined as: %r' % (key, self[key]))
+            if isinstance(value, auto):
+                if value.value == _auto_null:
+                    value.value = self._generate_next_value(
+                            key,
+                            1,
+                            len(self._member_names),
+                            self._last_values[:],
+                            )
+                    self._auto_called = True
+                value = value.value
+            self._member_names.append(key)
+            self._last_values.append(value)
+        super().__setitem__(key, value)
 
-                pygame.gfxdraw.aacircle(surf, x, y, self.piece_radius, stroke)
-                pygame.gfxdraw.filled_circle(surf, x, y, self.piece_radius, stroke)
-                pygame.gfxdraw.aacircle(surf, x, y, self.piece_radius-t-t, fill)
-                pygame.gfxdraw.filled_circle(surf, x, y, self.piece_radius-t-t, fill)
 
-            elif nodekey != self.NODE_WON:
-                x, y = self.nodes_abs_centers[nodekey]
-                fill, stroke, t = self.piece1_style if self.isP1(piece) else \
-                                  self.piece2_style
+# Dummy value for Enum as EnumMeta explicitly checks for it, but of course
+# until EnumMeta finishes running the first time the Enum class doesn't exist.
+# This is also why there are checks in EnumMeta like `if Enum is not None`
+Enum = None
 
-                pygame.gfxdraw.aacircle(surf, x, y, self.piece_radius, stroke)
-                pygame.gfxdraw.filled_circle(surf, x, y, self.piece_radius, stroke)
-                pygame.gfxdraw.aacircle(surf, x, y, self.piece_radius-t-t, fill)
-                pygame.gfxdraw.filled_circle(surf, x, y, self.piece_radius-t-t, fill)
+class EnumMeta(type):
+    """
+    Metaclass for Enum
+    """
+    @classmethod
+    def __prepare__(metacls, cls, bases, **kwds):
+        # check that previous enum members do not exist
+        metacls._check_for_existing_members(cls, bases)
+        # create the namespace dict
+        enum_dict = _EnumDict()
+        enum_dict._cls_name = cls
+        # inherit previous flags and _generate_next_value_ function
+        member_type, first_enum = metacls._get_mixins_(cls, bases)
+        if first_enum is not None:
+            enum_dict['_generate_next_value_'] = getattr(
+                    first_enum, '_generate_next_value_', None,
+                    )
+        return enum_dict
 
-                # pieces are stacked
-                if len(self.game.board[nodekey]) > 1:
-                    n_stacked = len(self.game.board[nodekey])
-                    text_surf = self.FONT.render(str(n_stacked), True, Color('white'))
-                    text_rect = text_surf.get_rect(center=(x, y))
-                    surf.blit(text_surf, text_rect)
+    def __new__(metacls, cls, bases, classdict, **kwds):
+        # an Enum class is final once enumeration items have been defined; it
+        # cannot be mixed with other types (int, float, etc.) if it has an
+        # inherited __new__ unless a new __new__ is defined (or the resulting
+        # class will fail).
+        #
+        # remove any keys listed in _ignore_
+        classdict.setdefault('_ignore_', []).append('_ignore_')
+        ignore = classdict['_ignore_']
+        for key in ignore:
+            classdict.pop(key, None)
+        member_type, first_enum = metacls._get_mixins_(cls, bases)
+        __new__, save_new, use_args = metacls._find_new_(
+                classdict, member_type, first_enum,
+                )
 
-    def draw_sticks(self, surf):
-        if self.game.sticks_been_tossed():
-            outcome = self.game.get_toss_outcome()
-            for stick_type, xy in zip(outcome, self.tossedsticks_abs_toplefts):
-                stick_im = self.stickM_im if stick_type == StickType.M else self.stickU_im
-                surf.blit(stick_im, xy)
-        else:
-            for sset_im, xy in zip(self.ssets_im.values(), self.ssets_abs_toplefts):
-                surf.blit(sset_im, xy)
+        # save enum items into separate mapping so they don't get baked into
+        # the new class
+        enum_members = {k: classdict[k] for k in classdict._member_names}
+        for name in classdict._member_names:
+            del classdict[name]
 
-    def draw_playerwins(self, surf):
-        winner = self.get_winner()
-        if winner:
-            winner_im = self.playerwins_im[winner]
-            surf.blit(winner_im, winner_im.get_rect(center=self.playerwins_rect.center))
+        # adjust the sunders
+        _order_ = classdict.pop('_order_', None)
 
-    # STATIC IMAGES
-    def get_graph_image(self):
-        surf = Surface(self.graph_rect.size)
-        surf.fill(self.BGCOLOR)
-        surf.set_colorkey(self.BGCOLOR)
+        # check for illegal enum names (any others?)
+        invalid_names = set(enum_members) & {'mro', ''}
+        if invalid_names:
+            raise ValueError('Invalid enum member name: {0}'.format(
+                ','.join(invalid_names)))
 
-        for name, center in self.nodes_rel_centers.items():
-            if name in BoardNode.CORNERS:
-                fill, stroke, t = self.corner_style
-                radius = self.corner_node_radius
+        # create a default docstring if one has not been provided
+        if '__doc__' not in classdict:
+            classdict['__doc__'] = 'An enumeration.'
+
+        enum_class = super().__new__(metacls, cls, bases, classdict, **kwds)
+        enum_class._member_names_ = []               # names in definition order
+        enum_class._member_map_ = {}                 # name->value map
+        enum_class._member_type_ = member_type
+
+        # save DynamicClassAttribute attributes from super classes so we know
+        # if we can take the shortcut of storing members in the class dict
+        dynamic_attributes = {
+                k for c in enum_class.mro()
+                for k, v in c.__dict__.items()
+                if isinstance(v, DynamicClassAttribute)
+                }
+
+        # Reverse value->name map for hashable values.
+        enum_class._value2member_map_ = {}
+
+        # If a custom type is mixed into the Enum, and it does not know how
+        # to pickle itself, pickle.dumps will succeed but pickle.loads will
+        # fail.  Rather than have the error show up later and possibly far
+        # from the source, sabotage the pickle protocol for this class so
+        # that pickle.dumps also fails.
+        #
+        # However, if the new class implements its own __reduce_ex__, do not
+        # sabotage -- it's on them to make sure it works correctly.  We use
+        # __reduce_ex__ instead of any of the others as it is preferred by
+        # pickle over __reduce__, and it handles all pickle protocols.
+        if '__reduce_ex__' not in classdict:
+            if member_type is not object:
+                methods = ('__getnewargs_ex__', '__getnewargs__',
+                        '__reduce_ex__', '__reduce__')
+                if not any(m in member_type.__dict__ for m in methods):
+                    if '__new__' in classdict:
+                        # too late, sabotage
+                        _make_class_unpicklable(enum_class)
+                    else:
+                        # final attempt to verify that pickling would work:
+                        # travel mro until __new__ is found, checking for
+                        # __reduce__ and friends along the way -- if any of them
+                        # are found before/when __new__ is found, pickling should
+                        # work
+                        sabotage = None
+                        for chain in bases:
+                            for base in chain.__mro__:
+                                if base is object:
+                                    continue
+                                elif any(m in base.__dict__ for m in methods):
+                                    # found one, we're good
+                                    sabotage = False
+                                    break
+                                elif '__new__' in base.__dict__:
+                                    # not good
+                                    sabotage = True
+                                    break
+                            if sabotage is not None:
+                                break
+                        if sabotage:
+                            _make_class_unpicklable(enum_class)
+        # instantiate them, checking for duplicates as we go
+        # we instantiate first instead of checking for duplicates first in case
+        # a custom __new__ is doing something funky with the values -- such as
+        # auto-numbering ;)
+        for member_name in classdict._member_names:
+            value = enum_members[member_name]
+            if not isinstance(value, tuple):
+                args = (value, )
             else:
-                fill, stroke, t = self.normal_style
-                radius = self.normal_node_radius
-            pygame.gfxdraw.aacircle(surf, *center, radius, stroke)
-            pygame.gfxdraw.filled_circle(surf, *center, radius, stroke)
-            pygame.gfxdraw.aacircle(surf, *center, radius-t-t, fill)
-            pygame.gfxdraw.filled_circle(surf, *center, radius-t-t, fill)
-
-        return surf.convert_alpha()
-
-    def get_regionsout_images(self):
-        surf1 = Surface(self.regout1_rect.size)
-        surf2 = Surface(self.regout2_rect.size)
-
-        fill1, stroke1, t1, alpha1 = self.regout1_style
-        fill2, stroke2, t2, alpha2 = self.regout2_style
-
-        surf1.fill(stroke1)
-        surf1.fill(fill1, (t1, t1, surf1.get_width()-t1-t1, surf1.get_height()-t1-t1))
-
-        surf2.fill(stroke2)
-        surf2.fill(fill2, (t2, t2, surf2.get_width()-t2-t2, surf2.get_height()-t2-t2))
-
-        surf1.set_alpha(int(alpha1 * 255))
-        surf2.set_alpha(int(alpha2 * 255))
-
-        return surf1.convert_alpha(), surf2.convert_alpha()
-
-    def get_table_image(self):
-        surf = Surface(self.table_rect.size)
-
-        fill, stroke, t, alpha = self.table_style
-
-        surf.fill(stroke)
-        surf.fill(fill, (t, t, surf.get_width()-t-t, surf.get_height()-t-t))
-        surf.set_alpha(int(alpha * 255))
-
-        return surf.convert_alpha()
-
-    def get_sticksets_images(self):
-        surf_mm = Surface(self.sset_size)
-        surf_mu = Surface(self.sset_size)
-        surf_uu = Surface(self.sset_size)
-
-        for surf in (surf_mm, surf_mu, surf_uu):
-            surf.fill(self.table_style[0])
-            surf.set_colorkey(surf.get_at([0, 0]))
-
-        sset_w, sset_h = self.sset_size
-        stick_w, stick_h = self.stick_size
-        sx = sset_w - 2 * stick_w
-        sy = sset_h - stick_h
-
-        surf_mm.blit(self.stickM_im, (0, sy))
-        surf_mm.blit(self.stickM_im, (stick_w + sx, sy))
-        surf_mu.blit(self.stickM_im, (0, sy))
-        surf_mu.blit(self.stickU_im, (stick_w + sx, sy))
-        surf_uu.blit(self.stickU_im, (0, sy))
-        surf_uu.blit(self.stickU_im, (stick_w + sx, sy))
-
-        return {StickComb.MM: surf_mm.convert_alpha(),
-                StickComb.MU: surf_mu.convert_alpha(),
-                StickComb.UU: surf_uu.convert_alpha()}
-
-    def get_stick_image(self, stick_type):
-        assert stick_type in StickType, \
-             f'Invalid stick type {stick_type!r} given!\n' \
-             f'Valid stick types = {StickType!r}.'
-
-        surf = Surface(self.stick_size)
-
-        fill, stroke, t = self.stick_style
-
-        surf.fill(stroke)
-        surf.fill(fill, (t, t, surf.get_width()-t-t, surf.get_height()-t-t))
-
-        if stick_type == StickType.MARKED:
-            # draw three vertical crosses on top
-            n = 3
-            r = surf.get_width() // 5
-            cross_h = r + r
-
-            # spacing
-            sx = surf.get_width() // 2
-            sy = (surf.get_height() - n * cross_h) // (n + 1)
-
-            # offset
-            x = sx
-            y = sy + r
-
-            for i in range(n):
-                cx, cy = (x, y + (sy + cross_h) * i)
-                pygame.draw.line(surf, stroke, (cx-r, cy-r), (cx+r, cy+r), t)
-                pygame.draw.line(surf, stroke, (cx-r, cy+r), (cx+r, cy-r), t)
-
-        return surf
-
-    def get_playerturn_images(self):
-        # settings
-        player1_color_str = self.player1_color_str
-        player2_color_str = self.player2_color_str
-        player1_color = self.piece1_style[0]
-        player2_color = self.piece2_style[0]
-
-        # render font
-        font = pygame.font.SysFont('Arial', 13)
-        surf1 = font.render(f'{player1_color_str} TURN', True, player1_color)
-        surf2 = font.render(f'{player2_color_str} TURN', True, player2_color)
-
-        # position between the out-regions
-        x0, y0 = self.regout1_rect.bottomleft
-        x1, y1 = self.regout2_rect.topright
-        x = x0 + (x1 - x0) // 2
-        y = y0 + (y1 - y0) // 2
-        self.playerturn_rect = surf1.get_rect(center=(x, y))
-        
-        return {self.PLAYER1: surf1,
-                self.PLAYER2: surf2}
-
-    def get_playerwins_images(self):
-        # settings
-        player1_color_str = self.player1_color_str
-        player2_color_str = self.player2_color_str
-        player1_color = self.piece1_style[0]
-        player2_color = self.piece2_style[0]
-
-        # render font
-        font = pygame.font.SysFont('Arial', 56)
-        surf1 = font.render(f'{player1_color_str} WINS', True, Color('gold'))
-        surf2 = font.render(f'{player2_color_str} WINS', True, Color('gold'))
-
-        # position center
-        self.playerwins_rect = surf1.get_rect()
-        self.playerwins_rect.center = self.nodes_abs_centers[BoardNode.CORNERS.CC]
-
-        bg = Surface(self.playerwins_rect.size)
-
-        bg1 = bg.copy()
-        bg1.fill(player1_color)
-        bg1.blit(surf1, (0, 0))
-
-        bg2 = bg.copy()
-        bg2.fill(player2_color)
-        bg2.blit(surf2, (0, 0))
-
-        return {self.PLAYER1: bg1.convert_alpha(),
-                self.PLAYER2: bg2.convert_alpha()}
-
-    # LAYOUT / POSITIONING
-    def vert(self, cornerA, cornerB, n_nodes=4):
-        (x, Ay), (x, By) = cornerA, cornerB
-
-        R = self.corner_node_radius
-        dy = (abs(By - Ay) - 2*R) // (n_nodes + 1)
-        dy = +dy if Ay < By else -dy
-
-        beg_y = Ay + R if Ay < By else Ay - R
-
-        return [(x, beg_y + i * dy) for i in range(1, n_nodes+1)]
-
-    def horz(self, cornerA, cornerB, n_nodes=4):
-        (Ax, y), (Bx, y) = cornerA, cornerB
-
-        R = self.corner_node_radius
-        dx = (abs(Bx - Ax) - 2*R) // (n_nodes + 1)
-        dx = +dx if Ax < Bx else -dx
-
-        beg_x = Ax + R if Ax < Bx else Ax - R
-
-        return [(beg_x + i * dx, y) for i in range(1, n_nodes+1)]
-
-    def diag(self, cornerA, cornerB, n_nodes=2):
-        (Ax, Ay), (Bx, By) = cornerA, cornerB
-
-        R = self.corner_node_radius
-        d = (abs(Bx - Ax) - 2*R) // (n_nodes + 1)
-        dx = +d if Ax < Bx else -d
-        dy = +d if Ay < By else -d
-
-        beg_x = Ax + R if Ax < Bx else Ax - R
-        beg_y = Ay + R if Ay < By else Ay - R
-
-        return [(beg_x + i * dx, beg_y + i * dy) for i in range(1, n_nodes+1)]
-
-    def _arrange_nodes(self):
-        nodes = {}
-
-        # corners positions (including center)
-        S = self.graph_rect.width
-        R = self.corner_node_radius
-
-        nodes[BoardNode.CORNERS.SW] = sw = (R, S-1-R)
-        nodes[BoardNode.CORNERS.NW] = nw = (R, R)
-        nodes[BoardNode.CORNERS.CC] = cc = (S//2, S//2)
-        nodes[BoardNode.CORNERS.NE] = ne = (S-1-R, R)
-        nodes[BoardNode.CORNERS.SE] = se = (S-1-R, S-1-R)
-
-        nodes[BoardNode.CrossA.G1] = g1 = (S//2, R)
-        nodes[BoardNode.CrossA.G4] = g4 = (S//2, S-1-R)
-        nodes[BoardNode.CrossB.R1] = r1 = (R, S//2)
-        nodes[BoardNode.CrossB.R4] = r4 = (S-1-R, S//2)
-
-        nodes[BoardNode.SPECIAL.WON] = (S+R+R, S-1-R)
-
-        # circuit nodes (clockwise) for vertical and horizontal paths
-        n_nodes = 5
-        # se -> ne (vertical)
-        for nodekey, xy in zip(BoardNode.EAST, self.vert(se, ne, n_nodes)):
-            nodes[nodekey] = xy
-        # ne -> nw (horizontal)
-        for nodekey, xy in zip(BoardNode.NORTH, self.horz(ne, nw, n_nodes)):
-            nodes[nodekey] = xy
-        # nw -> sw (vertical)
-        for nodekey, xy in zip(BoardNode.WEST, self.vert(nw, sw, n_nodes)):
-            nodes[nodekey] = xy
-        # sw -> se (horizontal)
-        for nodekey, xy in zip(BoardNode.SOUTH, self.horz(sw, se, n_nodes)):
-            nodes[nodekey] = xy
-
-        # cross nodes
-        n_nodes = 4
-
-        # g1 -> g4
-        for nodekey, xy in zip(BoardNode.CrossA, self.vert(g1, g4, n_nodes)):
-            nodes[nodekey] = xy
-        # r1 -> r4
-        for nodekey, xy in zip(BoardNode.CrossB, self.horz(r1, r4, n_nodes)):
-            nodes[nodekey] = xy
-
-
-        return nodes
-
-    def _arrange_pieces(self):
-        n = self.N_PIECES_PER_PLAYER
-        r = self.piece_radius
-        diam = r + r
-
-        # regions
-        x1, y1, (w1, h1) = 0, 0, self.regout1_rect.size
-        x2, y2, (w2, h2) = 0, 0, self.regout2_rect.size
-
-        # spacing
-        sx1 = (w1 - diam * n) // (n + 1)
-        sy1 = (h1 - diam * 1) // 2
-        sx2 = (w2 - diam * n) // (n + 1)
-        sy2 = (h2 - diam * 1) // 2
-
-        # offset
-        x1 += sx1 + r
-        y1 += sy1 + r
-        x2 += sx2 + r
-        y2 += sy2 + r
-
-        pieces1 = [(x1 + (sx1 + diam) * i, y1) for i in range(n)]
-        pieces2 = [(x2 + (sx2 + diam) * i, y2) for i in range(n)]
-
-        return {self.PLAYER1: pieces1, self.PLAYER2: pieces2}
-
-    def _arrange_sticksets(self):
-        table_w, table_h = self.table_rect.size
-        w, h = self.sset_size
-        n = 2  # num sticksets (marked (mm), mismatch (mu), unmarked (uu))
-
-        # spacing
-        sx = (table_w - w * n) // (n + 1)
-        sy = (table_h - h * 1) // 2
-
-        # rel offset (from table)
-        x = sx
-        y = sy
-
-        # toplefts
-        xys = [(x + (sx + w) * i, y) for i in range(n)]
-
-        return xys
-
-    def _arrange_tossedsticks(self):
-        table_w, table_h = self.table_rect.size
-        stick_w, stick_h = self.stick_size
-        n = 4  # num tossed sticks
-
-        # spacing
-        sx = stick_w
-
-        # all four tossedsticks size
-        w, h = (stick_w + sx) * n, stick_h
-        self.tossedsticks_size = (w, h)
-
-        # offset (centering)
-        x = (table_w - w) // 2
-        y = (table_h - h) // 2
-
-        # toplefts
-        sticks_xys = [(x + (stick_w + sx) * i, y) for i in range(n)]
-
-        return sticks_xys
-
-    def get_nodes_abs_centers(self):
-        # = pieces in abs centers (same centers with smaller radius)
-        x, y = self.graph_rect.topleft
-        return {nodekey: (x + dx, y + dy) for nodekey, (dx, dy) in self.nodes_rel_centers.items()}
-
-    def get_piecesout_abs_centers(self):
-        x1, y1 = self.regout1_rect.topleft
-        x2, y2 = self.regout2_rect.topleft
-        P1, P2 = self.PLAYER1, self.PLAYER2
-        return {P1: [(x1 + dx1, y1 + dy1) for dx1, dy1 in self.piecesout_rel_centers[P1]],
-                P2: [(x2 + dx2, y2 + dy2) for dx2, dy2 in self.piecesout_rel_centers[P2]]}
-
-    def get_sticksets_abs_toplefts(self):
-        x, y = self.table_rect.topleft
-        return [(x + dx, y + dy) for dx, dy in self.ssets_rel_toplefts]
-
-    def get_tossedsticks_abs_toplefts(self):
-        x, y = self.table_rect.topleft
-        return [(x + dx, y + dy) for dx, dy in self.tossedsticks_rel_toplefts]
-
-    # INTERACTIONS
-    def get_node_selected(self):
-        return self.node_sel
-
-    def get_stickset_selected(self):
-        return self.sset_sel
-
-    def get_winner(self):
-        return self.winner
-
-    def highlight_nodes(self, nodes):
-        self.hlight_nodes = nodes
-
-    def check_node_selection(self, nodes):
-        pressed = pygame.mouse.get_pressed()[0]
-
-        if pressed:
-            ux, uy = pygame.mouse.get_pos()
-            for nodekey in nodes:
-                if nodekey == self.NODE_OUT:
-                    r = self.piece_radius
-                    for x, y in self.piecesout_abs_centers[self.game.cur_player]:
-                        if hypot(y-uy, x-ux) < r:
-                            self.node_sel = nodekey
-                            return nodekey
-                else:
-                    x, y = self.nodes_abs_centers[nodekey]
-                    r = self.normal_node_radius
-                    if nodekey in BoardNode.CORNERS or nodekey == self.NODE_WON:
-                        r = self.corner_node_radius
-                    if hypot(y-uy, x-ux) < r:
-                        self.node_sel = nodekey
-                        return nodekey
-
-        self.node_sel = None
+                args = value
+            if member_type is tuple:   # special case for tuple enums
+                args = (args, )     # wrap it one more time
+            if not use_args:
+                enum_member = __new__(enum_class)
+                if not hasattr(enum_member, '_value_'):
+                    enum_member._value_ = value
+            else:
+                enum_member = __new__(enum_class, *args)
+                if not hasattr(enum_member, '_value_'):
+                    if member_type is object:
+                        enum_member._value_ = value
+                    else:
+                        enum_member._value_ = member_type(*args)
+            value = enum_member._value_
+            enum_member._name_ = member_name
+            enum_member.__objclass__ = enum_class
+            enum_member.__init__(*args)
+            # If another member with the same value was already defined, the
+            # new member becomes an alias to the existing one.
+            for name, canonical_member in enum_class._member_map_.items():
+                if canonical_member._value_ == enum_member._value_:
+                    enum_member = canonical_member
+                    break
+            else:
+                # Aliases don't appear in member names (only in __members__).
+                enum_class._member_names_.append(member_name)
+            # performance boost for any member that would not shadow
+            # a DynamicClassAttribute
+            if member_name not in dynamic_attributes:
+                setattr(enum_class, member_name, enum_member)
+            # now add to _member_map_
+            enum_class._member_map_[member_name] = enum_member
+            try:
+                # This may fail if value is not hashable. We can't add the value
+                # to the map, and by-value lookups for this value will be
+                # linear.
+                enum_class._value2member_map_[value] = enum_member
+            except TypeError:
+                pass
+
+        # double check that repr and friends are not the mixin's or various
+        # things break (such as pickle)
+        # however, if the method is defined in the Enum itself, don't replace
+        # it
+        for name in ('__repr__', '__str__', '__format__', '__reduce_ex__'):
+            if name in classdict:
+                continue
+            class_method = getattr(enum_class, name)
+            obj_method = getattr(member_type, name, None)
+            enum_method = getattr(first_enum, name, None)
+            if obj_method is not None and obj_method is class_method:
+                setattr(enum_class, name, enum_method)
+
+        # replace any other __new__ with our own (as long as Enum is not None,
+        # anyway) -- again, this is to support pickle
+        if Enum is not None:
+            # if the user defined their own __new__, save it before it gets
+            # clobbered in case they subclass later
+            if save_new:
+                enum_class.__new_member__ = __new__
+            enum_class.__new__ = Enum.__new__
+
+        # py3 support for definition order (helps keep py2/py3 code in sync)
+        if _order_ is not None:
+            if isinstance(_order_, str):
+                _order_ = _order_.replace(',', ' ').split()
+            if _order_ != enum_class._member_names_:
+                raise TypeError('member order does not match _order_')
+
+        return enum_class
+
+    def __bool__(self):
+        """
+        classes/types should always be True.
+        """
+        return True
+
+    def __call__(cls, value, names=None, *, module=None, qualname=None, type=None, start=1):
+        """
+        Either returns an existing member, or creates a new enum class.
+
+        This method is used both when an enum class is given a value to match
+        to an enumeration member (i.e. Color(3)) and for the functional API
+        (i.e. Color = Enum('Color', names='RED GREEN BLUE')).
+
+        When used for the functional API:
+
+        `value` will be the name of the new class.
+
+        `names` should be either a string of white-space/comma delimited names
+        (values will start at `start`), or an iterator/mapping of name, value pairs.
+
+        `module` should be set to the module this class is being created in;
+        if it is not set, an attempt to find that module will be made, but if
+        it fails the class will not be picklable.
+
+        `qualname` should be set to the actual location this class can be found
+        at in its module; by default it is set to the global scope.  If this is
+        not correct, unpickling will fail in some circumstances.
+
+        `type`, if set, will be mixed in as the first base class.
+        """
+        if names is None:  # simple value lookup
+            return cls.__new__(cls, value)
+        # otherwise, functional API: we're creating a new Enum type
+        return cls._create_(
+                value,
+                names,
+                module=module,
+                qualname=qualname,
+                type=type,
+                start=start,
+                )
+
+    def __contains__(cls, member):
+        if not isinstance(member, Enum):
+            raise TypeError(
+                "unsupported operand type(s) for 'in': '%s' and '%s'" % (
+                    type(member).__qualname__, cls.__class__.__qualname__))
+        return isinstance(member, cls) and member._name_ in cls._member_map_
+
+    def __delattr__(cls, attr):
+        # nicer error message when someone tries to delete an attribute
+        # (see issue19025).
+        if attr in cls._member_map_:
+            raise AttributeError("%s: cannot delete Enum member." % cls.__name__)
+        super().__delattr__(attr)
+
+    def __dir__(self):
+        return (
+                ['__class__', '__doc__', '__members__', '__module__']
+                + self._member_names_
+                )
+
+    def __getattr__(cls, name):
+        """
+        Return the enum member matching `name`
+
+        We use __getattr__ instead of descriptors or inserting into the enum
+        class' __dict__ in order to support `name` and `value` being both
+        properties for enum members (which live in the class' __dict__) and
+        enum members themselves.
+        """
+        if _is_dunder(name):
+            raise AttributeError(name)
+        try:
+            return cls._member_map_[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __getitem__(cls, name):
+        return cls._member_map_[name]
+
+    def __iter__(cls):
+        """
+        Returns members in definition order.
+        """
+        return (cls._member_map_[name] for name in cls._member_names_)
+
+    def __len__(cls):
+        return len(cls._member_names_)
+
+    @property
+    def __members__(cls):
+        """
+        Returns a mapping of member name->value.
+
+        This mapping lists all enum members, including aliases. Note that this
+        is a read-only view of the internal mapping.
+        """
+        return MappingProxyType(cls._member_map_)
+
+    def __repr__(cls):
+        return "<enum %r>" % cls.__name__
+
+    def __reversed__(cls):
+        """
+        Returns members in reverse definition order.
+        """
+        return (cls._member_map_[name] for name in reversed(cls._member_names_))
+
+    def __setattr__(cls, name, value):
+        """
+        Block attempts to reassign Enum members.
+
+        A simple assignment to the class namespace only changes one of the
+        several possible ways to get an Enum member from the Enum class,
+        resulting in an inconsistent Enumeration.
+        """
+        member_map = cls.__dict__.get('_member_map_', {})
+        if name in member_map:
+            raise AttributeError('Cannot reassign members.')
+        super().__setattr__(name, value)
+
+    def _create_(cls, class_name, names, *, module=None, qualname=None, type=None, start=1):
+        """
+        Convenience method to create a new Enum class.
+
+        `names` can be:
+
+        * A string containing member names, separated either with spaces or
+          commas.  Values are incremented by 1 from `start`.
+        * An iterable of member names.  Values are incremented by 1 from `start`.
+        * An iterable of (member name, value) pairs.
+        * A mapping of member name -> value pairs.
+        """
+        metacls = cls.__class__
+        bases = (cls, ) if type is None else (type, cls)
+        _, first_enum = cls._get_mixins_(cls, bases)
+        classdict = metacls.__prepare__(class_name, bases)
+
+        # special processing needed for names?
+        if isinstance(names, str):
+            names = names.replace(',', ' ').split()
+        if isinstance(names, (tuple, list)) and names and isinstance(names[0], str):
+            original_names, names = names, []
+            last_values = []
+            for count, name in enumerate(original_names):
+                value = first_enum._generate_next_value_(name, start, count, last_values[:])
+                last_values.append(value)
+                names.append((name, value))
+
+        # Here, names is either an iterable of (name, value) or a mapping.
+        for item in names:
+            if isinstance(item, str):
+                member_name, member_value = item, names[item]
+            else:
+                member_name, member_value = item
+            classdict[member_name] = member_value
+        enum_class = metacls.__new__(metacls, class_name, bases, classdict)
+
+        # TODO: replace the frame hack if a blessed way to know the calling
+        # module is ever developed
+        if module is None:
+            try:
+                module = sys._getframe(2).f_globals['__name__']
+            except (AttributeError, ValueError, KeyError):
+                pass
+        if module is None:
+            _make_class_unpicklable(enum_class)
+        else:
+            enum_class.__module__ = module
+        if qualname is not None:
+            enum_class.__qualname__ = qualname
+
+        return enum_class
+
+    def _convert_(cls, name, module, filter, source=None):
+        """
+        Create a new Enum subclass that replaces a collection of global constants
+        """
+        # convert all constants from source (or module) that pass filter() to
+        # a new Enum called name, and export the enum and its members back to
+        # module;
+        # also, replace the __reduce_ex__ method so unpickling works in
+        # previous Python versions
+        module_globals = vars(sys.modules[module])
+        if source:
+            source = vars(source)
+        else:
+            source = module_globals
+        # _value2member_map_ is populated in the same order every time
+        # for a consistent reverse mapping of number to name when there
+        # are multiple names for the same number.
+        members = [
+                (name, value)
+                for name, value in source.items()
+                if filter(name)]
+        try:
+            # sort by value
+            members.sort(key=lambda t: (t[1], t[0]))
+        except TypeError:
+            # unless some values aren't comparable, in which case sort by name
+            members.sort(key=lambda t: t[0])
+        cls = cls(name, members, module=module)
+        cls.__reduce_ex__ = _reduce_ex_by_name
+        module_globals.update(cls.__members__)
+        module_globals[name] = cls
+        return cls
+
+    @staticmethod
+    def _check_for_existing_members(class_name, bases):
+        for chain in bases:
+            for base in chain.__mro__:
+                if issubclass(base, Enum) and base._member_names_:
+                    raise TypeError(
+                            "%s: cannot extend enumeration %r"
+                            % (class_name, base.__name__)
+                            )
+
+    @staticmethod
+    def _get_mixins_(class_name, bases):
+        """
+        Returns the type for creating enum members, and the first inherited
+        enum class.
+
+        bases: the tuple of bases that was given to __new__
+        """
+        if not bases:
+            return object, Enum
+
+        def _find_data_type(bases):
+            data_types = set()
+            for chain in bases:
+                candidate = None
+                for base in chain.__mro__:
+                    if base is object:
+                        continue
+                    elif issubclass(base, Enum):
+                        if base._member_type_ is not object:
+                            data_types.add(base._member_type_)
+                            break
+                    elif '__new__' in base.__dict__:
+                        if issubclass(base, Enum):
+                            continue
+                        data_types.add(candidate or base)
+                        break
+                    else:
+                        candidate = candidate or base
+            if len(data_types) > 1:
+                raise TypeError('%r: too many data types: %r' % (class_name, data_types))
+            elif data_types:
+                return data_types.pop()
+            else:
+                return None
+
+        # ensure final parent class is an Enum derivative, find any concrete
+        # data type, and check that Enum has no members
+        first_enum = bases[-1]
+        if not issubclass(first_enum, Enum):
+            raise TypeError("new enumerations should be created as "
+                    "`EnumName([mixin_type, ...] [data_type,] enum_type)`")
+        member_type = _find_data_type(bases) or object
+        if first_enum._member_names_:
+            raise TypeError("Cannot extend enumerations")
+        return member_type, first_enum
+
+    @staticmethod
+    def _find_new_(classdict, member_type, first_enum):
+        """
+        Returns the __new__ to be used for creating the enum members.
+
+        classdict: the class dictionary given to __new__
+        member_type: the data type whose __new__ will be used by default
+        first_enum: enumeration to check for an overriding __new__
+        """
+        # now find the correct __new__, checking to see of one was defined
+        # by the user; also check earlier enum classes in case a __new__ was
+        # saved as __new_member__
+        __new__ = classdict.get('__new__', None)
+
+        # should __new__ be saved as __new_member__ later?
+        save_new = __new__ is not None
+
+        if __new__ is None:
+            # check all possibles for __new_member__ before falling back to
+            # __new__
+            for method in ('__new_member__', '__new__'):
+                for possible in (member_type, first_enum):
+                    target = getattr(possible, method, None)
+                    if target not in {
+                            None,
+                            None.__new__,
+                            object.__new__,
+                            Enum.__new__,
+                            }:
+                        __new__ = target
+                        break
+                if __new__ is not None:
+                    break
+            else:
+                __new__ = object.__new__
+
+        # if a non-object.__new__ is used then whatever value/tuple was
+        # assigned to the enum member name will be passed to __new__ and to the
+        # new enum member's __init__
+        if __new__ is object.__new__:
+            use_args = False
+        else:
+            use_args = True
+        return __new__, save_new, use_args
+
+
+class Enum(metaclass=EnumMeta):
+    """
+    Generic enumeration.
+
+    Derive from this class to define new enumerations.
+    """
+    def __new__(cls, value):
+        # all enum instances are actually created during class construction
+        # without calling this method; this method is called by the metaclass'
+        # __call__ (i.e. Color(3) ), and by pickle
+        if type(value) is cls:
+            # For lookups like Color(Color.RED)
+            return value
+        # by-value search for a matching enum member
+        # see if it's in the reverse mapping (for hashable values)
+        try:
+            return cls._value2member_map_[value]
+        except KeyError:
+            # Not found, no need to do long O(n) search
+            pass
+        except TypeError:
+            # not there, now do long search -- O(n) behavior
+            for member in cls._member_map_.values():
+                if member._value_ == value:
+                    return member
+        # still not found -- try _missing_ hook
+        try:
+            exc = None
+            result = cls._missing_(value)
+        except Exception as e:
+            exc = e
+            result = None
+        try:
+            if isinstance(result, cls):
+                return result
+            else:
+                ve_exc = ValueError("%r is not a valid %s" % (value, cls.__qualname__))
+                if result is None and exc is None:
+                    raise ve_exc
+                elif exc is None:
+                    exc = TypeError(
+                            'error in %s._missing_: returned %r instead of None or a valid member'
+                            % (cls.__name__, result)
+                            )
+                exc.__context__ = ve_exc
+                raise exc
+        finally:
+            # ensure all variables that could hold an exception are destroyed
+            exc = None
+            ve_exc = None
+
+    def _generate_next_value_(name, start, count, last_values):
+        """
+        Generate the next value when not given.
+
+        name: the name of the member
+        start: the initial start value or None
+        count: the number of existing members
+        last_value: the last value assigned or None
+        """
+        for last_value in reversed(last_values):
+            try:
+                return last_value + 1
+            except TypeError:
+                pass
+        else:
+            return start
+
+    @classmethod
+    def _missing_(cls, value):
         return None
 
-    def check_sticksets_selection(self):
-        pressed = pygame.mouse.get_pressed()[0]
+    def __repr__(self):
+        return "<%s.%s: %r>" % (
+                self.__class__.__name__, self._name_, self._value_)
 
-        if pressed:
-            ux, uy = pygame.mouse.get_pos()
-            for (comb, sset_im), (x, y) in zip(self.ssets_im.items(), self.ssets_abs_toplefts):
-                rect = Rect(x, y, *sset_im.get_size())
-                if rect.collidepoint(ux, uy):
-                    self.sset_sel = comb
-                    return comb
+    def __str__(self):
+        return "%s.%s" % (self.__class__.__name__, self._name_)
 
-        self.sset_sel = None
-        return None
+    def __dir__(self):
+        """
+        Returns all members and all public methods
+        """
+        added_behavior = [
+                m
+                for cls in self.__class__.mro()
+                for m in cls.__dict__
+                if m[0] != '_' and m not in self._member_map_
+                ] + [m for m in self.__dict__ if m[0] != '_']
+        return (['__class__', '__doc__', '__module__'] + added_behavior)
 
-    def check_replay_selection(self):
-        pressed = pygame.mouse.get_pressed()[0]
+    def __format__(self, format_spec):
+        """
+        Returns format using actual value type unless __str__ has been overridden.
+        """
+        # mixed-in Enums should use the mixed-in type's __format__, otherwise
+        # we can get strange results with the Enum name showing up instead of
+        # the value
 
-        if pressed:
-            ux, uy = pygame.mouse.get_pos()
-            if self.playerwins_rect.collidepoint(ux, uy):
-                self.game.reset()
-                self.check_winner()
+        # pure Enum branch, or branch with __str__ explicitly overridden
+        str_overridden = type(self).__str__ not in (Enum.__str__, Flag.__str__)
+        if self._member_type_ is object or str_overridden:
+            cls = str
+            val = str(self)
+        # mix-in branch
+        else:
+            cls = self._member_type_
+            val = self._value_
+        return cls.__format__(val, format_spec)
 
-    def check_winner(self):
-        self.winner = self.game.check_winner()
+    def __hash__(self):
+        return hash(self._name_)
+
+    def __reduce_ex__(self, proto):
+        return self.__class__, (self._value_, )
+
+    # DynamicClassAttribute is used to provide access to the `name` and
+    # `value` properties of enum members while keeping some measure of
+    # protection from modification, while still allowing for an enumeration
+    # to have members named `name` and `value`.  This works because enumeration
+    # members are not set directly on the enum class -- __getattr__ is
+    # used to look them up.
+
+    @DynamicClassAttribute
+    def name(self):
+        """The name of the Enum member."""
+        return self._name_
+
+    @DynamicClassAttribute
+    def value(self):
+        """The value of the Enum member."""
+        return self._value_
 
 
+class IntEnum(int, Enum):
+    """Enum where members are also (and must be) ints"""
 
-if __name__ == '__main__':
-    App().run()
+
+def _reduce_ex_by_name(self, proto):
+    return self.name
+
+class Flag(Enum):
+    """
+    Support for flags
+    """
+
+    def _generate_next_value_(name, start, count, last_values):
+        """
+        Generate the next value when not given.
+
+        name: the name of the member
+        start: the initial start value or None
+        count: the number of existing members
+        last_value: the last value assigned or None
+        """
+        if not count:
+            return start if start is not None else 1
+        for last_value in reversed(last_values):
+            try:
+                high_bit = _high_bit(last_value)
+                break
+            except Exception:
+                raise TypeError('Invalid Flag value: %r' % last_value) from None
+        return 2 ** (high_bit+1)
+
+    @classmethod
+    def _missing_(cls, value):
+        """
+        Returns member (possibly creating it) if one can be found for value.
+        """
+        original_value = value
+        if value < 0:
+            value = ~value
+        possible_member = cls._create_pseudo_member_(value)
+        if original_value < 0:
+            possible_member = ~possible_member
+        return possible_member
+
+    @classmethod
+    def _create_pseudo_member_(cls, value):
+        """
+        Create a composite member iff value contains only members.
+        """
+        pseudo_member = cls._value2member_map_.get(value, None)
+        if pseudo_member is None:
+            # verify all bits are accounted for
+            _, extra_flags = _decompose(cls, value)
+            if extra_flags:
+                raise ValueError("%r is not a valid %s" % (value, cls.__qualname__))
+            # construct a singleton enum pseudo-member
+            pseudo_member = object.__new__(cls)
+            pseudo_member._name_ = None
+            pseudo_member._value_ = value
+            # use setdefault in case another thread already created a composite
+            # with this value
+            pseudo_member = cls._value2member_map_.setdefault(value, pseudo_member)
+        return pseudo_member
+
+    def __contains__(self, other):
+        """
+        Returns True if self has at least the same flags set as other.
+        """
+        if not isinstance(other, self.__class__):
+            raise TypeError(
+                "unsupported operand type(s) for 'in': '%s' and '%s'" % (
+                    type(other).__qualname__, self.__class__.__qualname__))
+        return other._value_ & self._value_ == other._value_
+
+    def __repr__(self):
+        cls = self.__class__
+        if self._name_ is not None:
+            return '<%s.%s: %r>' % (cls.__name__, self._name_, self._value_)
+        members, uncovered = _decompose(cls, self._value_)
+        return '<%s.%s: %r>' % (
+                cls.__name__,
+                '|'.join([str(m._name_ or m._value_) for m in members]),
+                self._value_,
+                )
+
+    def __str__(self):
+        cls = self.__class__
+        if self._name_ is not None:
+            return '%s.%s' % (cls.__name__, self._name_)
+        members, uncovered = _decompose(cls, self._value_)
+        if len(members) == 1 and members[0]._name_ is None:
+            return '%s.%r' % (cls.__name__, members[0]._value_)
+        else:
+            return '%s.%s' % (
+                    cls.__name__,
+                    '|'.join([str(m._name_ or m._value_) for m in members]),
+                    )
+
+    def __bool__(self):
+        return bool(self._value_)
+
+    def __or__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return self.__class__(self._value_ | other._value_)
+
+    def __and__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return self.__class__(self._value_ & other._value_)
+
+    def __xor__(self, other):
+        if not isinstance(other, self.__class__):
+            return NotImplemented
+        return self.__class__(self._value_ ^ other._value_)
+
+    def __invert__(self):
+        members, uncovered = _decompose(self.__class__, self._value_)
+        inverted = self.__class__(0)
+        for m in self.__class__:
+            if m not in members and not (m._value_ & self._value_):
+                inverted = inverted | m
+        return self.__class__(inverted)
+
+
+class IntFlag(int, Flag):
+    """
+    Support for integer-based Flags
+    """
+
+    @classmethod
+    def _missing_(cls, value):
+        """
+        Returns member (possibly creating it) if one can be found for value.
+        """
+        if not isinstance(value, int):
+            raise ValueError("%r is not a valid %s" % (value, cls.__qualname__))
+        new_member = cls._create_pseudo_member_(value)
+        return new_member
+
+    @classmethod
+    def _create_pseudo_member_(cls, value):
+        """
+        Create a composite member iff value contains only members.
+        """
+        pseudo_member = cls._value2member_map_.get(value, None)
+        if pseudo_member is None:
+            need_to_create = [value]
+            # get unaccounted for bits
+            _, extra_flags = _decompose(cls, value)
+            # timer = 10
+            while extra_flags:
+                # timer -= 1
+                bit = _high_bit(extra_flags)
+                flag_value = 2 ** bit
+                if (flag_value not in cls._value2member_map_ and
+                        flag_value not in need_to_create
+                        ):
+                    need_to_create.append(flag_value)
+                if extra_flags == -flag_value:
+                    extra_flags = 0
+                else:
+                    extra_flags ^= flag_value
+            for value in reversed(need_to_create):
+                # construct singleton pseudo-members
+                pseudo_member = int.__new__(cls, value)
+                pseudo_member._name_ = None
+                pseudo_member._value_ = value
+                # use setdefault in case another thread already created a composite
+                # with this value
+                pseudo_member = cls._value2member_map_.setdefault(value, pseudo_member)
+        return pseudo_member
+
+    def __or__(self, other):
+        if not isinstance(other, (self.__class__, int)):
+            return NotImplemented
+        result = self.__class__(self._value_ | self.__class__(other)._value_)
+        return result
+
+    def __and__(self, other):
+        if not isinstance(other, (self.__class__, int)):
+            return NotImplemented
+        return self.__class__(self._value_ & self.__class__(other)._value_)
+
+    def __xor__(self, other):
+        if not isinstance(other, (self.__class__, int)):
+            return NotImplemented
+        return self.__class__(self._value_ ^ self.__class__(other)._value_)
+
+    __ror__ = __or__
+    __rand__ = __and__
+    __rxor__ = __xor__
+
+    def __invert__(self):
+        result = self.__class__(~self._value_)
+        return result
+
+
+def _high_bit(value):
+    """
+    returns index of highest bit, or -1 if value is zero or negative
+    """
+    return value.bit_length() - 1
+
+def unique(enumeration):
+    """
+    Class decorator for enumerations ensuring unique member values.
+    """
+    duplicates = []
+    for name, member in enumeration.__members__.items():
+        if name != member.name:
+            duplicates.append((name, member.name))
+    if duplicates:
+        alias_details = ', '.join(
+                ["%s -> %s" % (alias, name) for (alias, name) in duplicates])
+        raise ValueError('duplicate values found in %r: %s' %
+                (enumeration, alias_details))
+    return enumeration
+
+def _decompose(flag, value):
+    """
+    Extract all members from the value.
+    """
+    # _decompose is only called if the value is not named
+    not_covered = value
+    negative = value < 0
+    members = []
+    for member in flag:
+        member_value = member.value
+        if member_value and member_value & value == member_value:
+            members.append(member)
+            not_covered &= ~member_value
+    if not negative:
+        tmp = not_covered
+        while tmp:
+            flag_value = 2 ** _high_bit(tmp)
+            if flag_value in flag._value2member_map_:
+                members.append(flag._value2member_map_[flag_value])
+                not_covered &= ~flag_value
+            tmp &= ~flag_value
+    if not members and value in flag._value2member_map_:
+        members.append(flag._value2member_map_[value])
+    members.sort(key=lambda m: m._value_, reverse=True)
+    if len(members) > 1 and members[0].value == value:
+        # we have the breakdown, don't need the value member itself
+        members.pop(0)
+    return members, not_covered
