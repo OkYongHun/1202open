@@ -13,7 +13,7 @@ class App:
     config = dict(
         WSIZE   = (600, 600),
         FPS     = 30,
-        TITLE   = '다함께 윷윷윷'
+        TITLE   = '다함께 하지마마 윷윷윷'
     )
 
     def __init__(self):
@@ -94,9 +94,7 @@ class GUI:
         x, y, w, h = self.graph_rect = Rect([W//25, W//25, W*63//100, W*63//100])
         self.corner_node_radius = self.graph_rect.width//25
         self.normal_node_radius = self.graph_rect.width//30
-        self.SP_double_node_radius = self.graph_rect.width//30
         self.piece_radius = self.normal_node_radius*3//4
-
 
         # Regions out
         s = W - w   # space right
@@ -134,8 +132,6 @@ class GUI:
         self.corner_style = (Color('orange'), Color('black'), 1)
         self.normal_style = (Color('white'), Color('black'), 1)
         self.hlight_style = (Color('lightblue'), 3)
-        self.SP_double_style = (Color('green'), Color('black'), 1)
-
 
         # Regions out (player1, player2)
         self.regout1_style = (Color('blue'), Color('black'), 2, 0.5)
@@ -322,16 +318,9 @@ class GUI:
             if name in BoardNode.CORNERS:
                 fill, stroke, t = self.corner_style
                 radius = self.corner_node_radius
-
-            elif name in BoardNode.SP_double:
-                fill, stroke, t = self.SP_double_style
-                radius = self.SP_double_node_radius
-
             else:
                 fill, stroke, t = self.normal_style
                 radius = self.normal_node_radius
-            pygame.gfxdraw.aacircle(surf, *center, radius, stroke)
-            pygame.gfxdraw.filled_circle(surf, *center, radius, stroke)
             pygame.gfxdraw.aacircle(surf, *center, radius, stroke)
             pygame.gfxdraw.filled_circle(surf, *center, radius, stroke)
             pygame.gfxdraw.aacircle(surf, *center, radius-t-t, fill)
@@ -525,7 +514,6 @@ class GUI:
         nodes[BoardNode.CORNERS.CC] = cc = (S//2, S//2)
         nodes[BoardNode.CORNERS.NE] = ne = (S-1-R, R)
         nodes[BoardNode.CORNERS.SE] = se = (S-1-R, S-1-R)
-        nodes[BoardNode.SP_double.E4] = E4 = (R, S//3)
 
         nodes[BoardNode.CrossA.G1] = g1 = (S//2, R)
         nodes[BoardNode.CrossA.G4] = g4 = (S//2, S-1-R)
@@ -547,17 +535,6 @@ class GUI:
             nodes[nodekey] = xy
         # sw -> se (horizontal)
         for nodekey, xy in zip(BoardNode.SOUTH, self.horz(sw, se, n_nodes)):
-            nodes[nodekey] = xy
-
-        n_nodes = 5
-
-        for nodekey, xy in zip(BoardNode.EAST, self.vert(se, ne, n_nodes)):
-            nodes[nodekey] = xy
-
-        # E3 -> NE
-        n_nodes = 6
-
-        for nodekey, xy in zip(BoardNode.SP_double, self.vert(ne, se, n_nodes)):
             nodes[nodekey] = xy
 
         # cross nodes
