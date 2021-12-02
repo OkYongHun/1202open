@@ -113,7 +113,7 @@ class BoardNode(object):
     SPECIAL = Enum('SPECIAL', dict(OUT='OUT', WON='WON'))
     CORNERS = Enum('CORNERS', dict(SE='SE', NE='NE', CC='CC', NW='NW', SW='SW'))
 
-    EAST = Enum('EAST', dict(E1='E1', E2='E2', E3='E3', E4='E4', E5='E5'))
+    EAST = Enum('EAST', dict(E1='E1', E2='E2', E3='E3' ))
     NORTH = Enum('NORTH', dict(N1='N1', N2='N2', N3='N3', N4='N4', N5='N5'))
     WEST = Enum('WEST', dict(W1='W1', W2='W2', W3='W3', W4='W4', W5='W5'))
     SOUTH = Enum('SOUTH', dict(S1='S1', S2='S2', S3='S3', S4='S4', S5='S5'))
@@ -121,21 +121,21 @@ class BoardNode(object):
     CrossA = Enum('CrossA', dict(G1='G1', G2='G2', G3='G3', G4='G4'))
     CrossB = Enum('CrossB', dict(R1='R1', R2='R2', R3='R3', R4='R4'))
 
-
+    SP_double = Enum('SP_double', dict(E4='E4,', E5='E5' ))
 
 class BoardGraph(object):
 
     OUT, WON = BoardNode.SPECIAL
     SE, NE, CC, NW, SW = BoardNode.CORNERS
 
-    E1, E2, E3, E4, E5 = BoardNode.EAST
+    E1, E2, E3 = BoardNode.EAST
     N1, N2, N3, N4, N5 = BoardNode.NORTH
     W1, W2, W3, W4, W5 = BoardNode.WEST
     S1, S2, S3, S4, S5 = BoardNode.SOUTH
+    E4, E5 = BoardNode.SP_double
 
     G1, G2, G3, G4 = BoardNode.CrossA
     R1, R2, R3, R4 = BoardNode.CrossB
-
 
 
     LAYOUT = (
